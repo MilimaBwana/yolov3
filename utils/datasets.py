@@ -13,6 +13,7 @@ import torch
 from PIL import Image, ExifTags
 from torch.utils.data import Dataset
 from tqdm import tqdm
+from scipy import ndimage
 
 from utils.utils import xyxy2xywh, xywh2xyxy
 
@@ -494,17 +495,25 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
         if self.augment:
             # random left-right flip
             lr_flip = True
-            if lr_flip and random.random() < 0.5:
+            if lr_flip and random.random() < 0.25:
                 img = np.fliplr(img)
                 if nL:
                     labels[:, 1] = 1 - labels[:, 1]
 
             # random up-down flip
-            ud_flip = False
-            if ud_flip and random.random() < 0.5:
+            ud_flip = True
+            if ud_flip and random.random() < 0.25:
                 img = np.flipud(img)
                 if nL:
                     labels[:, 2] = 1 - labels[:, 2]
+
+            rotate = False
+            # TODO: added
+            if rotate and nL and random.random() < 0.25:
+                angle = np.random.uniform(-20, 20)
+                classes = labels[:, :1]
+                img, labels = augment_rotate(img, labels[:, 1:], angle)
+                labels = np.hstack([classes, labels])
 
         labels_out = torch.zeros((nL, 6))
         if nL:
@@ -558,6 +567,103 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     # if random.random() < 0.2:
     #     for i in range(3):
     #         img[:, :, i] = cv2.equalizeHist(img[:, :, i])
+
+
+def augment_rotate(img, bboxes, angle):
+    w, h = img.shape[1], img.shape[0]
+    img = ndimage.rotate(img, -angle, reshape=False)
+    bboxes = np.asarray([rotate_single_bbox(bbox, h, w, angle) for bbox in bboxes])
+
+    return img, bboxes
+
+
+def rotate_single_bbox(bbox, image_height, image_width, degrees):
+    image_height = np.float32(image_height)
+    image_width = np.float32(image_width)
+
+    # Convert from degrees to radians.
+    degrees_to_radians = math.pi / 180.0
+    radians = degrees * degrees_to_radians
+
+    # Translate the bbox to the center of the image and turn the normalized 0-1
+    # coordinates to absolute pixel locations.
+    # Y coordinates are made negative as the y axis of images goes down with
+    # increasing pixel values, so we negate to make sure x axis and y axis points
+    # are in the traditionally positive direction.
+    min_y = -(np.int32(image_height * (bbox[0] - 0.5)))
+    min_x = np.int32(image_width * (bbox[1] - 0.5))
+    max_y = -(np.int32(image_height*(bbox[2] - 0.5)))
+    max_x = np.int32(image_width * (bbox[3] - 0.5))
+
+    coordinates = np.stack(
+        [[min_y, min_x], [min_y, max_x], [max_y, min_x], [max_y, max_x]])
+    coordinates = np.float32(coordinates)
+    # Rotate the coordinates according to the rotation matrix clockwise if
+    # radians is positive, else negative
+    rotation_matrix = np.stack(
+        [[np.cos(radians), np.sin(radians)],
+         [-np.sin(radians), np.cos(radians)]])
+    new_coords = np.int32(np.matmul(rotation_matrix, np.transpose(coordinates)))
+
+    # Find min/max values and convert them back to normalized 0-1 floats.
+    min_y = -(np.float32(np.amax(new_coords[0, :])) / image_height - 0.5)
+    min_x = np.float32(np.amin(new_coords[1, :])) / image_width + 0.5
+    max_y = -(np.float32(np.amin(new_coords[0, :])) /image_height - 0.5)
+    max_x = np.float32(np.amax(new_coords[1, :]))/ image_width + 0.5
+
+    # Clip the bboxes to be sure the fall between [0, 1].
+    min_y, min_x, max_y, max_x = __clip_bbox(min_y, min_x, max_y, max_x)
+    min_y, min_x, max_y, max_x = __check_bbox_area(min_y, min_x, max_y, max_x)
+
+    return np.stack([min_y, min_x, max_y, max_x])
+
+
+def __clip_bbox(min_y, min_x, max_y, max_x):
+    """Clip bounding box coordinates between 0 and 1.
+    Args:
+      min_y: Normalized bbox coordinate of type float between 0 and 1.
+      min_x: Normalized bbox coordinate of type float between 0 and 1.
+      max_y: Normalized bbox coordinate of type float between 0 and 1.
+      max_x: Normalized bbox coordinate of type float between 0 and 1.
+    Returns:
+      Clipped coordinate values between 0 and 1.
+    """
+    min_y = np.clip(min_y, 0.0, 1.0)
+    min_x = np.clip(min_x, 0.0, 1.0)
+    max_y = np.clip(max_y, 0.0, 1.0)
+    max_x = np.clip(max_x, 0.0, 1.0)
+    return min_y, min_x, max_y, max_x
+
+
+def __check_bbox_area(min_y, min_x, max_y, max_x, delta=0.05):
+    """Adjusts bbox coordinates to make sure the area is > 0.
+    Args:
+      min_y: Normalized bbox coordinate of type float between 0 and 1.
+      min_x: Normalized bbox coordinate of type float between 0 and 1.
+      max_y: Normalized bbox coordinate of type float between 0 and 1.
+      max_x: Normalized bbox coordinate of type float between 0 and 1.
+      delta: Float, this is used to create a gap of size 2 * delta between
+        bbox min/max coordinates that are the same on the boundary.
+        This prevents the bbox from having an area of zero.
+    Returns:
+      Tuple of new bbox coordinates between 0 and 1 that will now have a
+      guaranteed area > 0.
+    """
+    height = max_y - min_y
+    width = max_x - min_x
+
+    def __adjust_bbox_boundaries(min_coord, max_coord):
+        # Make sure max is never 0 and min is never 1.
+        max_coord = np.maximum(max_coord, 0.0 + delta)
+        min_coord = np.minimum(min_coord, 1.0 - delta)
+        return min_coord, max_coord
+
+    if height == 0.0:
+        min_y, max_y = __adjust_bbox_boundaries(min_y, max_y)
+    if width == 0.0:
+        min_x, max_x = __adjust_bbox_boundaries(min_x, max_x)
+
+    return min_y, min_x, max_y, max_x
 
 
 def load_mosaic(self, index):

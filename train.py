@@ -9,6 +9,7 @@ import test  # import test.py to get mAP after each epoch
 from models import *
 from utils.datasets import *
 from utils.utils import *
+import matplotlib.pyplot as plt
 
 mixed_precision = True
 try:  # Mixed precision training https://github.com/NVIDIA/apex
@@ -16,6 +17,7 @@ try:  # Mixed precision training https://github.com/NVIDIA/apex
 except:
     print('Apex recommended for faster mixed precision training: https://github.com/NVIDIA/apex')
     mixed_precision = False  # not installed
+
 
 wdir = 'weights' + os.sep  # weights dir
 last = wdir + 'last.pt'
@@ -28,7 +30,7 @@ hyp = {'giou': 3.54,  # giou loss gain
        'cls_pw': 1.0,  # cls BCELoss positive_weight
        'obj': 64.3,  # obj loss gain (*=img_size/320 if img_size != 320)
        'obj_pw': 1.0,  # obj BCELoss positive_weight
-       'iou_t': 0.20,  # iou training threshold
+       'iou_t': 0.50,  # iou training threshold
        'lr0': 0.01,  # initial learning rate (SGD=5E-3, Adam=5E-4)
        'lrf': 0.0005,  # final learning rate (with cos scheduler)
        'momentum': 0.937,  # SGD momentum
@@ -59,6 +61,7 @@ def train(hyp):
     data = opt.data
     epochs = opt.epochs  # 500200 batches at bs 64, 117263 images = 273 epochs
     batch_size = opt.batch_size
+
     accumulate = max(round(64 / batch_size), 1)  # accumulate n times before optimizer update (bs 64)
     weights = opt.weights  # initial training weights
     imgsz_min, imgsz_max, imgsz_test = opt.img_size  # img sizes (min, max, test)
@@ -80,7 +83,8 @@ def train(hyp):
     data_dict = parse_data_cfg(data)
     train_path = data_dict['train']
     test_path = data_dict['valid']
-    nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
+    nc = int(data_dict['nc'])
+    # nc = 1 if opt.single_cls else int(data_dict['classes'])  # number of classes
     hyp['cls'] *= nc / 80  # update coco-tuned hyp['cls'] to current dataset
 
     # Remove previous results
@@ -102,10 +106,10 @@ def train(hyp):
 
     if opt.adam:
         # hyp['lr0'] *= 0.1  # reduce lr (i.e. SGD=5E-3, Adam=5E-4)
-        optimizer = optim.Adam(pg0, lr=hyp['lr0'])
+        optimizer = optim.Adam(pg0, lr=opt.learning_rate)
         # optimizer = AdaBound(pg0, lr=hyp['lr0'], final_lr=0.1)
     else:
-        optimizer = optim.SGD(pg0, lr=hyp['lr0'], momentum=hyp['momentum'], nesterov=True)
+        optimizer = optim.SGD(pg0, lr=opt.learning_rate, momentum=hyp['momentum'], nesterov=True)
     optimizer.add_param_group({'params': pg1, 'weight_decay': hyp['weight_decay']})  # add pg1 with weight_decay
     optimizer.add_param_group({'params': pg2})  # add pg2 (biases)
     print('Optimizer groups: %g .bias, %g Conv2d.weight, %g other' % (len(pg2), len(pg1), len(pg0)))
@@ -151,7 +155,8 @@ def train(hyp):
         load_darknet_weights(model, weights)
 
     if opt.freeze_layers:
-        output_layer_indices = [idx - 1 for idx, module in enumerate(model.module_list) if isinstance(module, YOLOLayer)]
+        output_layer_indices = [idx - 1 for idx, module in enumerate(model.module_list) if
+                                isinstance(module, YOLOLayer)]
         freeze_layer_indices = [x for x in range(len(model.module_list)) if
                                 (x not in output_layer_indices) and
                                 (x - 1 not in output_layer_indices)]
@@ -164,21 +169,31 @@ def train(hyp):
         model, optimizer = amp.initialize(model, optimizer, opt_level='O1', verbosity=0)
 
     # Scheduler https://arxiv.org/pdf/1812.01187.pdf
-    lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
-    scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
-    scheduler.last_epoch = start_epoch - 1  # see link below
-    # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
+    if opt.lr_strategy.lower() == 'cosine':
+        lf = lambda x: (((1 + math.cos(x * math.pi / epochs)) / 2) ** 1.0) * 0.95 + 0.05  # cosine
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf, verbose=True)
+        scheduler.last_epoch = start_epoch - 1  # see link below
+        # https://discuss.pytorch.org/t/a-problem-occured-when-resuming-an-optimizer/28822
 
-    # Plot lr schedule
-    # y = []
-    # for _ in range(epochs):
-    #     scheduler.step()
-    #     y.append(optimizer.param_groups[0]['lr'])
-    # plt.plot(y, '.-', label='LambdaLR')
-    # plt.xlabel('epoch')
-    # plt.ylabel('LR')
-    # plt.tight_layout()
-    # plt.savefig('LR.png', dpi=300)
+        # Plot lr schedule
+        # y = []
+        # for _ in range(epochs):
+        #      scheduler.step()
+        #      y.append(optimizer.param_groups[0]['lr'])
+        # plt.plot(y, '.-', label='LambdaLR')
+        # plt.xlabel('epoch')
+        # plt.ylabel('LR')
+        # plt.tight_layout()
+        # plt.savefig('LR.png', dpi=300)
+    elif opt.lr_strategy.lower() == 'exponentialdecay':
+        lf = lambda x: opt.learning_rate * 0.5 ** float(x // 5)
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1, last_epoch=-1, verbose=True)
+    elif opt.lr_strategy.lower() == 'plateaudecay':
+        lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, threshold=0.0001,
+                                       threshold_mode='rel', cooldown=0, min_lr=0, eps=1e-08, verbose=True)
+    else:
+        lf = lambda epoch: 1
+        scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf, verbose=True)
 
     # Initialize distributed training
     if device.type != 'cpu' and torch.cuda.device_count() > 1 and torch.distributed.is_available():
@@ -261,6 +276,7 @@ def train(hyp):
                 accumulate = max(1, np.interp(ni, xi, [1, 64 / batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    #x['lr'] = np.interp(ni, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * optimizer.param_groups[0]['lr']])
                     x['lr'] = np.interp(ni, xi, [0.1 if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     x['weight_decay'] = np.interp(ni, xi, [0.0, hyp['weight_decay'] if j == 1 else 0.0])
                     if 'momentum' in x:
@@ -314,15 +330,12 @@ def train(hyp):
 
             # end batch ------------------------------------------------------------------------------------------------
 
-        # Update scheduler
-        scheduler.step()
-
         # Process epoch results
         ema.update_attr(model)
         final_epoch = epoch + 1 == epochs
         if not opt.notest or final_epoch:  # Calculate mAP
             is_coco = any([x in data for x in ['coco.data', 'coco2014.data', 'coco2017.data']]) and model.nc == 80
-            results, maps = test.test(cfg,
+            results, maps5, maps7 = test.test(cfg,
                                       data,
                                       batch_size=batch_size,
                                       imgsz=imgsz_test,
@@ -330,11 +343,11 @@ def train(hyp):
                                       save_json=final_epoch and is_coco,
                                       single_cls=opt.single_cls,
                                       dataloader=testloader,
-                                      multi_label=ni > n_burn)
+                                      multi_label=ni > n_burn) # results contain mp, mr, map5, map7, losses
 
         # Write
         with open(results_file, 'a') as f:
-            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP, F1, test_losses=(GIoU, obj, cls)
+            f.write(s + '%10.3g' * 7 % results + '\n')  # P, R, mAP@0.5, mAP@0.7, test_losses=(GIoU, obj, cls)
         if len(opt.name) and opt.bucket:
             os.system('gsutil cp results.txt gs://%s/results/results%s.txt' % (opt.bucket, opt.name))
 
@@ -350,6 +363,13 @@ def train(hyp):
         fi = fitness(np.array(results).reshape(1, -1))  # fitness_i = weighted combination of [P, R, mAP, F1]
         if fi > best_fitness:
             best_fitness = fi
+
+
+        # Update scheduler
+        if opt.lr_strategy.lower() == 'plateaudecay':
+            scheduler.step(fi)
+        else:
+            scheduler.step()
 
         # Save model
         save = (not opt.nosave) or (final_epoch and not opt.evolve)
@@ -410,6 +430,8 @@ if __name__ == '__main__':
     parser.add_argument('--adam', action='store_true', help='use adam optimizer')
     parser.add_argument('--single-cls', action='store_true', help='train as single-class dataset')
     parser.add_argument('--freeze-layers', action='store_true', help='Freeze non-output layers')
+    parser.add_argument('--learning_rate', type=float, help='Initial Learning rate')
+    parser.add_argument('--lr_strategy', type=str, help='Learning rate strategy')
     opt = parser.parse_args()
     opt.weights = last if opt.resume and not opt.weights else opt.weights
     check_git_status()

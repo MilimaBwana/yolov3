@@ -53,10 +53,11 @@ def check_file(file):
         return files[0]  # return first file if multiple found
 
 
-def load_classes(path):
+def load_classes(names):
     # Loads *.names file at 'path'
-    with open(path, 'r') as f:
-        names = f.read().split('\n')
+    #with open(path, 'r') as f:
+    #    names = f.read().split('\n')
+    names = names.split(',')
     return list(filter(None, names))  # filter removes empty strings (such as last line)
 
 
@@ -469,6 +470,7 @@ def build_targets(p, targets, model):
         anch.append(anchors[a])  # anchors
         tcls.append(c)  # class
         if c.shape[0]:  # if any targets
+            #print(c)
             assert c.max() < model.nc, 'Model accepts %g classes labeled from 0-%g, however you labelled a class %g. ' \
                                        'See https://github.com/ultralytics/yolov3/wiki/Train-Custom-Data' % (
                                            model.nc, model.nc - 1, c.max())

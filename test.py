@@ -50,15 +50,20 @@ def test(cfg,
     else:  # called by train.py
         is_training = True
         device = next(model.parameters()).device  # get model device
-        verbose = False
+        verbose = True
 
     # Configure run
     data = parse_data_cfg(data)
-    nc = 1 if single_cls else int(data['classes'])  # number of classes
-    path = data['valid']  # path to test images
-    names = load_classes(data['names'])  # class names
-    iouv = torch.linspace(0.5, 0.95, 10).to(device)  # iou vector for mAP@0.5:0.95
-    iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
+    #nc = 1 if single_cls else int(data['classes'])  # number of classes
+
+    nc = int(data['nc'])
+    if is_training:
+        path = data['valid']  # path to test images
+    else:
+        path = data['test']
+    names = load_classes(data['classes'])  # class names
+    iouv = torch.linspace(0.5, 0.7, 2).to(device)  # iou vector for mAP@0.5:0.95
+    #iouv = iouv[0].view(1)  # comment for mAP@0.5:0.95
     niou = iouv.numel()
 
     # Dataloader
@@ -76,10 +81,11 @@ def test(cfg,
     _ = model(torch.zeros((1, 3, imgsz, imgsz), device=device)) if device.type != 'cpu' else None  # run once
     coco91class = coco80_to_coco91_class()
     s = ('%20s' + '%10s' * 6) % ('Class', 'Images', 'Targets', 'P', 'R', 'mAP@0.5', 'F1')
-    p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
+    p, r, f1, mp, mr, ap5, ap7, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
-    jdict, stats, ap, ap_class = [], [], [], []
-    for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    jdict, stats, ap_5, ap_7, ap_class = [], [], [], [], []
+    #for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
+    for batch_i, (imgs, targets, paths, shapes) in enumerate(dataloader):
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
         nb, _, height, width = imgs.shape  # batch size, channels, height, width
@@ -135,6 +141,7 @@ def test(cfg,
                                   'score': round(p[4], 5)})
 
             # Assign all predictions as incorrect
+            #for iou in iouv:
             correct = torch.zeros(pred.shape[0], niou, dtype=torch.bool, device=device)
             if nl:
                 detected = []  # target indices
@@ -154,6 +161,7 @@ def test(cfg,
                         ious, i = box_iou(pred[pi, :4], tbox[ti]).max(1)  # best ious, indices
 
                         # Append detections
+
                         for j in (ious > iouv[0]).nonzero():
                             d = ti[i[j]]  # detected target
                             if d not in detected:
@@ -164,7 +172,6 @@ def test(cfg,
 
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
-
         # Plot images
         if batch_i < 1:
             f = 'test_batch%g_gt.jpg' % batch_i  # filename
@@ -176,21 +183,22 @@ def test(cfg,
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
     if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
-        if niou > 1:
-            p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
-        mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+        #if niou > 1:
+        p, r, ap_5, ap_7 = p[:, 0], r[:, 0], ap[:, 0], ap[:, 1]  # [P, R, AP@0.5,  AP@0.7]
+        mp, mr, map5, map7 = p.mean(), r.mean(), ap_5.mean(), ap_7.mean()
         nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
 
     # Print results
     pf = '%20s' + '%10.3g' * 6  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
+    print(('%20s' + '%10s'*6) % ('name', 'nb_img', 'nb_bb', 'prec', 'rec', 'ap@0.5', 'ap@0.7'))
+    print(pf % ('all', seen, nt.sum(), mp, mr, map5, map7))
 
     # Print results per class
     if verbose and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
+            print(pf % (names[c], seen, nt[c], p[i], r[i], ap_5[i], ap_7[i]))
 
     # Print speeds
     if verbose or save_json:
@@ -222,11 +230,7 @@ def test(cfg,
             print('WARNING: pycocotools must be installed with numpy==1.17 to run correctly. '
                   'See https://github.com/cocodataset/cocoapi/issues/356')
 
-    # Return results
-    maps = np.zeros(nc) + map
-    for i, c in enumerate(ap_class):
-        maps[c] = ap[i]
-    return (mp, mr, map, mf1, *(loss.cpu() / len(dataloader)).tolist()), maps
+    return (mp, mr, map5, map7, *(loss.cpu() / len(dataloader)).tolist()), ap[:,0], ap[:,1]
 
 
 if __name__ == '__main__':
