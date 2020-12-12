@@ -3,7 +3,7 @@ from scipy import ndimage
 import cv2
 import tensorflow as tf
 import math
-from custom.preprocessing.preprocessing_ops import get_dataset_as_dataframe
+from custom.preprocessing.preprocessing_ops import ds_as_df
 from custom.config.dataset_config import Dataset
 import matplotlib.pyplot as plt
 from custom.nn_util.detection_visualization import draw_boxes, draw_annotations

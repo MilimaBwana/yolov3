@@ -126,7 +126,7 @@ def test(cfg,
             # Clip boxes to image bounds
             clip_coords(pred, (height, width))
 
-            # Append to pycocotools JSON dictionary
+            # Append to pycocotools JSON label2name
             if save_json:
                 # [{"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}, ...
                 image_id = int(Path(paths[si]).stem.split('_')[-1])
